@@ -991,5 +991,162 @@ check("20f: 无法安全修复时返回失败与原因",
       res20f)
 check("20f: 失败后原树保持不变", r20["tree"]["boundary"] == "B")
 
+# 21. multipart/form-data 字段检查 --------------------------------------------
+print("21) form-data 字段检查")
+from app import formdata
+
+# 21a. 嵌套 form-data 容器：字符集优先级、_charset_ 位置无关、重复 name、文件项
+_gbk = lambda s: s.encode("gbk")
+raw21 = b"".join([
+    b'Content-Type: multipart/mixed; boundary=TOP\r\n\r\n',
+    b'--TOP\r\nContent-Type: multipart/form-data; boundary=FD\r\n\r\n',
+    # parts[0].parts[0]：无叶子 charset；容器 _charset_=gbk 排在最后仍生效
+    b'--FD\r\nContent-Disposition: form-data; name="early"\r\n\r\n'
+    + _gbk("张三") + b'\r\n',
+    # parts[0].parts[1]：叶子 charset=utf-8 优先于容器 gbk
+    b'--FD\r\nContent-Disposition: form-data; name="leafchar"\r\n'
+    b'Content-Type: text/plain; charset="utf-8"\r\n\r\n'
+    + "你好".encode() + b'\r\n',
+    # parts[0].parts[2/3]：重复 name 保留为多条有序记录
+    b'--FD\r\nContent-Disposition: form-data; name="dup"\r\n\r\n1\r\n',
+    b'--FD\r\nContent-Disposition: form-data; name="dup"\r\n\r\n2\r\n',
+    # parts[0].parts[4]：带 filename -> 文件项，不计入文本字段
+    b'--FD\r\nContent-Disposition: form-data; name="up"; filename="a.txt"\r\n'
+    b'Content-Type: text/plain\r\n\r\nxyz\r\n',
+    # parts[0].parts[5]：_charset_ 自身也是文本字段
+    b'--FD\r\nContent-Disposition: form-data; name="_charset_"\r\n\r\ngbk\r\n',
+    b'--FD--\r\n',
+    # parts[1]：第二个 form-data 容器，无 _charset_ -> 默认 UTF-8（容器隔离）
+    b'--TOP\r\nContent-Type: multipart/form-data; boundary=FD2\r\n\r\n'
+    b'--FD2\r\nContent-Disposition: form-data; name="f2"\r\n\r\n'
+    + "你好".encode() + b'\r\n--FD2--\r\n',
+    b'--TOP--',
+])
+r21 = mime.parse_message(None, None, None, raw_base64=base64.b64encode(raw21).decode())
+check("21: 解析成功", r21["ok"], r21.get("issues"))
+fd = formdata.inspect_form_data(r21["tree"])
+check("21: 发现 2 个 form-data 容器（嵌套于 mixed，按先序）",
+      fd["ok"] and [c["path"] for c in fd["containers"]] == ["parts[0]", "parts[1]"],
+      [c["path"] for c in fd["containers"]])
+c1, c2 = fd["containers"]
+check("21: 容器 1 的 _charset_ 默认值（排在最后仍作用于本容器）",
+      c1["defaultCharset"] == "gbk", c1["defaultCharset"])
+check("21: 容器 2 无 _charset_ -> null（UTF-8 回退）",
+      c2["defaultCharset"] is None, c2["defaultCharset"])
+f1 = c1["fields"]
+check("21: 直接叶子按原顺序全部列出（含文件项与 _charset_）",
+      [x["name"] for x in f1]
+      == ["early", "leafchar", "dup", "dup", "up", "_charset_"],
+      [x["name"] for x in f1])
+check("21: 容器 _charset_ 作用于排在其前的字段",
+      f1[0]["value"] == "张三" and f1[0]["charset"] == "gbk"
+      and f1[0]["charsetSource"] == "container" and f1[0]["status"] == "ok", f1[0])
+check("21: 叶子 charset 优先于容器 _charset_",
+      f1[1]["value"] == "你好" and f1[1]["charset"] == "utf-8"
+      and f1[1]["charsetSource"] == "leaf", f1[1])
+check("21: 重复 name 保留为多条有序记录",
+      f1[2]["name"] == "dup" and f1[2]["value"] == "1"
+      and f1[3]["name"] == "dup" and f1[3]["value"] == "2", (f1[2], f1[3]))
+check("21: 带 filename 的叶子标为文件项、不解码文本",
+      f1[4]["kind"] == "file" and f1[4]["status"] == "file"
+      and f1[4]["filename"] == "a.txt" and f1[4]["value"] is None, f1[4])
+check("21: _charset_ 自身也作为文本字段列出",
+      f1[5]["kind"] == "text" and f1[5]["value"] == "gbk", f1[5])
+check("21: 容器计数（文件项不计入文本字段）",
+      c1["fieldCount"] == 5 and c1["fileCount"] == 1 and c1["errorCount"] == 0,
+      (c1["fieldCount"], c1["fileCount"], c1["errorCount"]))
+check("21: 容器 2 默认 UTF-8 且容器间互不影响",
+      c2["fields"][0]["value"] == "你好"
+      and c2["fields"][0]["charset"] == "utf-8"
+      and c2["fields"][0]["charsetSource"] == "default", c2["fields"][0])
+check("21: 汇总计数",
+      fd["summary"] == {"containers": 2, "fields": 6, "files": 1, "errors": 0},
+      fd["summary"])
+
+# 21b. 根级 form-data：未知字符集 / 解码失败 / 畸形与未知 CTE / 无效 _charset_
+raw21b = b"".join([
+    b'Content-Type: multipart/form-data; boundary=E\r\n\r\n',
+    # 未知叶子字符集
+    b'--E\r\nContent-Disposition: form-data; name="badcs"\r\n'
+    b'Content-Type: text/plain; charset=x-no-such-charset\r\n\r\nabc\r\n',
+    # 声明 utf-8 但字节非法
+    b'--E\r\nContent-Disposition: form-data; name="badutf"\r\n'
+    b'Content-Type: text/plain; charset=utf-8\r\n\r\n\xff\xfe bad\r\n',
+    # 畸形 base64（未编辑）
+    b'--E\r\nContent-Disposition: form-data; name="badcte"\r\n'
+    b'Content-Transfer-Encoding: base64\r\n\r\n@@@not-base64!!!\r\n',
+    # 未知 CTE（未编辑）
+    b'--E\r\nContent-Disposition: form-data; name="unkcte"\r\n'
+    b'Content-Transfer-Encoding: x-uuencode\r\n\r\nwhatever\r\n',
+    # 第一个 _charset_ 无效，第二个有效（gbk）
+    b'--E\r\nContent-Disposition: form-data; name="_charset_"\r\n\r\nx-invalid\r\n',
+    b'--E\r\nContent-Disposition: form-data; name="_charset_"\r\n\r\ngbk\r\n',
+    # 无叶子 charset -> 容器 gbk
+    b'--E\r\nContent-Disposition: form-data; name="viac"\r\n\r\n'
+    + _gbk("李四") + b'\r\n',
+    b'--E--',
+])
+r21b = mime.parse_message(None, None, None,
+                          raw_base64=base64.b64encode(raw21b).decode())
+fdb = formdata.inspect_form_data(r21b["tree"])
+cb = fdb["containers"][0]
+fb = {x["name"]: x for x in cb["fields"] if x["name"] != "_charset_"}
+check("21b: 根级 form-data 容器路径为 root", cb["path"] == "root", cb["path"])
+check("21b: 首个 _charset_ 无效时取下一个有效值",
+      cb["defaultCharset"] == "gbk", cb["defaultCharset"])
+check("21b: 未知字符集显示原因且不给文本",
+      fb["badcs"]["status"] == "unknown-charset"
+      and fb["badcs"]["value"] is None
+      and "x-no-such-charset" in fb["badcs"]["reason"], fb["badcs"])
+check("21b: 解码失败显示原因、不用替换字符伪造文本",
+      fb["badutf"]["status"] == "decode-failed"
+      and fb["badutf"]["value"] is None
+      and "utf-8" in fb["badutf"]["reason"], fb["badutf"])
+check("21b: 畸形 CTE 未编辑显示原因",
+      fb["badcte"]["status"] == "cte-malformed"
+      and fb["badcte"]["value"] is None
+      and "畸形" in fb["badcte"]["reason"], fb["badcte"])
+check("21b: 未知 CTE 未编辑显示原因",
+      fb["unkcte"]["status"] == "cte-unknown"
+      and fb["unkcte"]["value"] is None
+      and "x-uuencode" in fb["unkcte"]["reason"], fb["unkcte"])
+check("21b: 容器 _charset_ 解码 gbk 字段",
+      fb["viac"]["value"] == "李四" and fb["viac"]["charset"] == "gbk"
+      and fb["viac"]["charsetSource"] == "container", fb["viac"])
+check("21b: 异常计数（4 个失败字段）",
+      cb["errorCount"] == 4 and fdb["summary"]["errors"] == 4,
+      (cb["errorCount"], fdb["summary"]))
+
+# 21c. 编辑头部/正文后按当前树刷新
+t21 = r21["tree"]
+fd1 = t21["parts"][0]["parts"][0]   # early（容器 gbk）
+hdr1 = next(h for h in fd1["headers"]
+            if h["name"].lower() == "content-disposition")
+hdr1["value"] = 'form-data; name="renamed"'
+fd2n = t21["parts"][0]["parts"][1]  # leafchar -> 加 filename 变文件项
+hdr2 = next(h for h in fd2n["headers"]
+            if h["name"].lower() == "content-disposition")
+hdr2["value"] = 'form-data; name="leafchar"; filename="now-a-file.txt"'
+f2n = t21["parts"][1]["parts"][0]   # 容器 2（默认 UTF-8）改正文
+f2n["body"] = "改名后的值"
+f2n["bodyEdited"] = True
+fdc = formdata.inspect_form_data(t21)
+cc1, cc2 = fdc["containers"]
+check("21c: 编辑 Content-Disposition 后 name 刷新",
+      cc1["fields"][0]["name"] == "renamed", cc1["fields"][0])
+check("21c: 头部加 filename 后变为文件项且不计入文本字段",
+      cc1["fields"][1]["kind"] == "file"
+      and cc1["fields"][1]["filename"] == "now-a-file.txt"
+      and cc1["fieldCount"] == 4 and cc1["fileCount"] == 2, cc1["fields"][1])
+check("21c: 编辑正文后文本值刷新",
+      cc2["fields"][0]["value"] == "改名后的值", cc2["fields"][0])
+
+# 21d. 非 form-data 树 -> 空容器列表
+r21d = mime.parse_message(raw2.decode(), None, None)  # 第 2 节的嵌套 mixed 报文
+fdd = formdata.inspect_form_data(r21d["tree"])
+check("21d: 非 form-data 树返回空容器列表",
+      fdd["ok"] and fdd["containers"] == []
+      and fdd["summary"]["containers"] == 0, fdd["summary"])
+
 print(f"\n结果: {PASS} 通过, {FAIL} 失败")
 sys.exit(1 if FAIL else 0)

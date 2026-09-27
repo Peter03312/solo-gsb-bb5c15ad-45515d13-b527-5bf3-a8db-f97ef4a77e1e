@@ -51,6 +51,14 @@
   逐条展示来源路径、原始引用、作用域、候选路径以及**唯一匹配 / 缺失 / 重复歧义**
   （重复时列出全部候选但不默认选取）。点击「检查」使用当前树；正文、头部、
   CTE、增删部分后自动重新检查并更新。
+- 🧾 **form-data 字段检查面板**：在编辑树旁侧栏逐个 `multipart/form-data`
+  容器按原顺序列出直接叶子的 name、节点路径、文本值与状态；带 `filename`
+  的叶子标为**文件项**，不计入文本字段。文本先按叶子 Content-Type 的
+  `charset` 解码；未声明时使用同容器首个有效的 `_charset_` 字段值
+  （与位置无关，即使排在后面也作用于本容器），仍无则用 UTF-8。
+  重复 name 保留为多条有序记录；CTE 畸形、未知字符集或解码失败时显示
+  原因，不用替换字符伪造文本。结果可导出为**保序 JSON 数组**；
+  编辑头部或正文后自动刷新。
 
 ---
 
@@ -155,7 +163,26 @@ http://localhost:8000/docs 。
    - 点击侧栏右上角「检查」立即使用**当前树**重新检查；在结构树中编辑正文、
      头部（含 Content-ID / Content-Type）、切换 CTE、新增或删除部分后，
      停止输入片刻自动重查（与附件列表共用防抖）。
-10. **样本对比**（页面底部「5. 样本对比」卡片）：
+10. **form-data 字段检查**（结构树右侧侧栏，CID 检查下方，解析后自动出现）：
+   - 逐个 `multipart/form-data` 容器（含嵌套；按节点当前 Content-Type 判断）
+     按原顺序列出**直接叶子**：`#序号`、name（重复 name 保留为多条有序记录并
+     标注「重复 name」）、节点路径、媒体类型、文本值与状态；
+   - 带 `filename` / `filename*` 参数的叶子标为**文件项**（蓝色），不做文本
+     解码，也不计入文本字段计数；
+   - 文本字符集优先级：叶子 `Content-Type` 的 `charset` → 同容器首个有效的
+     `_charset_` 字段值 → UTF-8。`_charset_` 与位置无关：即使排在容器末尾
+     也作用于本容器全部字段；多个 `_charset_` 时取第一个值可读出且为已知
+     文本字符集的。每条记录标注实际使用的字符集及来源
+     （叶子 charset / `_charset_` 字段 / 默认 UTF-8）；
+   - CTE 畸形（`malformed`）或未知 CTE（`passthrough`）的**未编辑**叶子、
+     未知字符集、解码失败：该条显示**状态与原因**，文本值为空——绝不使用
+     替换字符（U+FFFD）伪造文本；
+   - 点击「检查」立即使用**当前树**重新检查；编辑头部（含 Content-Disposition
+     / Content-Type）、正文、切换 CTE、增删部分后自动刷新；
+   - 点击「导出 JSON」把当前结果下载为 `form-data-fields.json`——一个
+     **保序 JSON 数组**（容器按先序、字段按容器内原顺序展开），每条含
+     container / path / name / kind / status / charset / value / reason。
+11. **样本对比**（页面底部「5. 样本对比」卡片）：
    - 解析一份报文后点击结构区右上角的 **存为样本 A**；再解析（或编辑后重新解析）
      另一份报文，点击 **存为样本 B**。样本保存在浏览器 localStorage，刷新不丢失；
    - 点击 **开始对比**，查看按树路径对齐的差异清单（新增 / 删除 / 修改 / 未变化，
@@ -548,6 +575,62 @@ CID 引用静态检查：请求体只有 `/api/parse` 返回（可能已被前�
 | 非引用 | `http(s):` URL、CSS 中的 `url(cid:…)`、注释文本均不扫描（只识别标签属性）；`srcset` 等其他属性不提取 |
 | 叶子 | 仅叶子（`kind: "part"`）参与 Content-ID 匹配；multipart 容器无 Content-ID |
 
+### `POST /api/formdata`
+
+multipart/form-data 字段检查：请求体只有 `/api/parse` 返回（可能已被前端
+修改）的 `tree`。逐个 `multipart/form-data` 容器（含嵌套；按节点**当前
+Content-Type 头部**判断）按原顺序列出**直接叶子**的字段记录；name 与
+filename 取自节点当前 Content-Disposition。
+
+```json
+{ "tree": { /* 当前树，可修改 */ } }
+```
+
+响应（节选）：
+
+```json
+{
+  "ok": true,
+  "summary": { "containers": 1, "fields": 3, "files": 1, "errors": 1 },
+  "containers": [
+    {
+      "path": "root",
+      "mediaType": "multipart/form-data",
+      "defaultCharset": "gbk",
+      "fieldCount": 3,
+      "fileCount": 1,
+      "errorCount": 1,
+      "fields": [
+        { "path": "parts[0]", "name": "early", "mediaType": "text/plain",
+          "kind": "text", "status": "ok",
+          "charset": "gbk", "charsetSource": "container",
+          "value": "张三", "filename": null, "reason": null },
+        { "path": "parts[1]", "name": "up", "mediaType": "text/plain",
+          "kind": "file", "status": "file",
+          "charset": null, "charsetSource": null,
+          "value": null, "filename": "a.txt", "reason": null },
+        { "path": "parts[2]", "name": "bad", "mediaType": "text/plain",
+          "kind": "text", "status": "decode-failed",
+          "charset": "utf-8", "charsetSource": "leaf",
+          "value": null, "filename": null,
+          "reason": "正文无法按字符集 'utf-8' 解码（…）；已保留原始字节，不使用替换字符伪造文本" }
+      ]
+    }
+  ]
+}
+```
+
+规则与字段：
+
+| 项 | 说明 |
+| --- | --- |
+| 容器 | 当前 Content-Type 为 `multipart/form-data` 的 multipart 节点，按先序列出；嵌套 form-data 各自成为独立容器；`defaultCharset` 为同容器首个有效 `_charset_` 字段值（无则 `null`） |
+| 记录 | 容器的**直接叶子**（`kind: "part"`），按原顺序；重复 name 保留为多条有序记录；嵌套 multipart 子节点不列入父容器 |
+| 文件项 | 带 `filename` / `filename*` 参数的叶子：`kind`/`status` 为 `file`，不计入文本字段，不解码文本 |
+| 字符集 | 叶子 Content-Type `charset`（`charsetSource: "leaf"`）→ 同容器首个有效 `_charset_` 字段值（`"container"`，与位置无关）→ UTF-8（`"default"`）；多个 `_charset_` 取第一个值可读出且为已知文本字符集的 |
+| `status` | `ok` / `file` / `cte-malformed`（畸形 CTE 未编辑）/ `cte-unknown`（未知 CTE 未编辑）/ `unknown-charset` / `decode-failed` |
+| 失败语义 | 失败记录 `value` 为 `null` 且 `reason` 给出原因；绝不使用替换字符伪造文本 |
+
 ### `GET /api/health`
 
 返回 `{"ok": true}`，供容器健康检查使用。
@@ -560,18 +643,19 @@ CID 引用静态检查：请求体只有 `/api/parse` 返回（可能已被前�
 .
 ├── app/
 │   ├── __init__.py
-│   ├── main.py              # FastAPI 应用：/api/parse、/api/encode、/api/fix-boundaries、/api/diff、/api/attachments、/api/cid-check、静态文件
+│   ├── main.py              # FastAPI 应用：/api/parse、/api/encode、/api/fix-boundaries、/api/diff、/api/attachments、/api/cid-check、/api/formdata、静态文件
 │   ├── mime.py              # 零第三方依赖的 MIME 解析 / 重新编码核心
 │   ├── boundaryfix.py       # 定界符冲突修复：按实际回写字节自内向外检查并为冲突层生成新 boundary
 │   ├── attachments.py       # RFC 2231 文件名解析、附件发现与 ZIP 打包（标准库 zipfile）
 │   ├── cidcheck.py          # multipart/related 作用域内的 cid: 引用静态检查（标准库 html.parser）
+│   ├── formdata.py          # multipart/form-data 字段检查：逐容器保序字段、_charset_ 容器字符集、严格解码
 │   ├── diff.py              # 样本对比：按树路径对齐的字段级差异计算
 │   └── static/
 │       ├── index.html       # 页面结构
 │       ├── styles.css       # 深色主题样式
-│       └── app.js           # 原生 JS：示例、树形编辑器、定界符冲突修复、附件提取、CID 引用检查、样本对比、下载
+│       └── app.js           # 原生 JS：示例、树形编辑器、定界符冲突修复、附件提取、CID 引用检查、form-data 字段检查、样本对比、下载
 ├── tests/
-│   └── smoke_test.py        # 解析/编码/修复/对比端到端测试（仅需 Python 标准库）
+│   └── smoke_test.py        # 解析/编码/修复/对比/字段检查端到端测试（仅需 Python 标准库）
 ├── requirements.txt
 ├── Dockerfile
 ├── docker-compose.yml
@@ -606,7 +690,13 @@ CID 引用检查（最近 related 祖先作用域、嵌套 related 子树排除�
 只修冲突层、未编辑叶子按原始传输字节判断（base64 传输字节无碰撞不修复、
 QP 传输字节有碰撞则修复）、编辑后按新回写字节判断、修复值同步
 Content-Type、新 boundary 符合 RFC 2046、修复后重解析结构与内容一致、
-无冲突不变更、候选耗尽时整体失败且原树不变）。
+无冲突不变更、候选耗尽时整体失败且原树不变），以及
+form-data 字段检查（嵌套容器发现与容器隔离、直接叶子按原序列出、
+叶子 charset 优先于容器 `_charset_`、`_charset_` 排在后面仍作用于本容器、
+首个无效 `_charset_` 跳过取下一个、无声明时 UTF-8 回退、重复 name
+多条有序记录、带 filename 标为文件项且不计入文本字段、未知字符集/
+解码失败/畸形与未知 CTE 显示原因且不伪造文本、编辑头部或正文后按
+当前树刷新、非 form-data 树返回空容器列表）。
 
 ---
 

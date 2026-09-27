@@ -22,6 +22,10 @@ let attachDebounce = null;
 let cidResult = null;
 let cidDebounce = null;
 
+// form-data 字段检查：最近一次 /api/formdata 返回与防抖句柄（树编辑后自动重查）
+let formdataResult = null;
+let formdataDebounce = null;
+
 // 样本对比：A/B 两份解析结果快照（localStorage 持久化）与最近一次 diff 结果
 const SAMPLES = { a: null, b: null };
 let diffResult = null;
@@ -549,6 +553,7 @@ async function doParse() {
     rerenderTree();
     loadAttachments({ resetSelection: true });
     loadCidCheck();
+    loadFormdata();
   } catch (e) {
     alert("解析失败：" + e.message);
   } finally {
@@ -692,11 +697,12 @@ const ATTACH_DECODE_LABEL = {
 
 function scheduleAttachRefresh(delay = 400) {
   // 正文输入/头部编辑/CTE 切换等树变化后延迟刷新附件列表（不清空当前勾选）
-  // 同一批编辑也会重新运行 CID 引用检查（使用当前树）。
+  // 同一批编辑也会重新运行 CID 引用检查与 form-data 字段检查（使用当前树）。
   if (!tree) return;
   clearTimeout(attachDebounce);
   attachDebounce = setTimeout(loadAttachments, delay);
   scheduleCidRefresh(delay);
+  scheduleFormdataRefresh(delay);
 }
 
 // ------------------------------------------------------------- CID check --
@@ -840,6 +846,190 @@ function renderCidRef(ref, scope) {
   }
   li.appendChild(detail);
   return li;
+}
+
+// ------------------------------------------------------- form-data fields --
+
+const FD_STATUS_LABEL = {
+  ok: "解码成功",
+  file: "文件项",
+  "cte-malformed": "CTE 畸形",
+  "cte-unknown": "未知 CTE",
+  "unknown-charset": "未知字符集",
+  "decode-failed": "解码失败",
+};
+const FD_CHARSET_SOURCE_LABEL = {
+  leaf: "叶子 charset",
+  container: "_charset_ 字段",
+  default: "默认 UTF-8",
+};
+
+function scheduleFormdataRefresh(delay = 400) {
+  if (!tree) return;
+  clearTimeout(formdataDebounce);
+  formdataDebounce = setTimeout(loadFormdata, delay);
+}
+
+async function loadFormdata() {
+  if (!tree) {
+    $("#formdataCard").classList.add("hidden");
+    return;
+  }
+  reindexPaths(tree, "root");
+  try {
+    const data = await postJSON("/api/formdata", { tree });
+    formdataResult = data;
+    $("#formdataCard").classList.remove("hidden");
+    renderFormdata(data);
+  } catch (e) {
+    $("#formdataMeta").textContent = "form-data 字段检查失败：" + e.message;
+  }
+}
+
+function renderFormdata(data) {
+  const s = data.summary || {};
+  $("#formdataMeta").innerHTML =
+    `容器 <b>${s.containers || 0}</b> · 文本字段 <b>${s.fields || 0}</b> · ` +
+    `文件项 <b>${s.files || 0}</b> · 异常 <b>${s.errors || 0}</b>`;
+  const root = $("#formdataResult");
+  root.innerHTML = "";
+  if (!(data.containers || []).length) {
+    const div = document.createElement("div");
+    div.className = "cid-empty";
+    div.textContent = "当前树中没有 multipart/form-data 容器（按节点当前 Content-Type 判断）。";
+    root.appendChild(div);
+    return;
+  }
+  for (const c of data.containers) root.appendChild(renderFdContainer(c));
+}
+
+function renderFdContainer(c) {
+  const box = document.createElement("div");
+  box.className = "fd-container";
+
+  const head = document.createElement("div");
+  head.className = "fd-container-head";
+  const csBadge = c.defaultCharset
+    ? `<span class="fd-charset" title="同容器首个有效 _charset_ 字段值，作用于本容器全部未声明 charset 的字段">` +
+      `_charset_ = ${escapeHtml(c.defaultCharset)}</span>`
+    : `<span class="fd-charset none" title="无有效 _charset_ 字段；未声明 charset 的字段按 UTF-8 解码">` +
+      `无 _charset_ · 默认 UTF-8</span>`;
+  head.innerHTML =
+    `<span class="badge multipart">${escapeHtml(c.mediaType)}</span>` +
+    `<span class="fd-path" title="容器节点路径">${escapeHtml(c.path)}</span>` +
+    csBadge +
+    `<span class="node-spacer"></span>` +
+    `<span class="fd-counts">字段 ${c.fieldCount} · 文件 ${c.fileCount}` +
+    (c.errorCount ? ` · <b class="fd-err-count">异常 ${c.errorCount}</b>` : "") +
+    `</span>`;
+  box.appendChild(head);
+
+  if (!(c.fields || []).length) {
+    const empty = document.createElement("div");
+    empty.className = "cid-empty cid-empty-inline";
+    empty.textContent = "该容器没有直接叶子部分。";
+    box.appendChild(empty);
+    return box;
+  }
+
+  // 重复 name 统计（同名保留为多条有序记录，徽标仅作提示）
+  const nameCount = {};
+  for (const f of c.fields) {
+    if (f.name != null) nameCount[f.name] = (nameCount[f.name] || 0) + 1;
+  }
+  const ul = document.createElement("ul");
+  ul.className = "fd-list";
+  c.fields.forEach((f, i) =>
+    ul.appendChild(renderFdField(f, i, f.name != null && nameCount[f.name] > 1)));
+  box.appendChild(ul);
+  return box;
+}
+
+function renderFdField(f, idx, isDup) {
+  const li = document.createElement("li");
+  const isFile = f.kind === "file";
+  const isErr = !isFile && f.status !== "ok";
+  li.className = "fd-field" + (isFile ? " fd-file" : "") + (isErr ? " fd-err" : "");
+
+  const top = document.createElement("div");
+  top.className = "fd-line1";
+  const nameHtml = f.name != null
+    ? `<span class="fd-name" title="Content-Disposition 的 name 参数">${escapeHtml(f.name)}</span>`
+    : `<span class="fd-name fd-noname" title="该叶子没有 name 参数">（无 name）</span>`;
+  const kindBadge = isFile
+    ? `<span class="fd-kind file">文件项</span>`
+    : `<span class="fd-kind">文本</span>`;
+  const dupBadge = isDup
+    ? `<span class="fd-dup" title="同容器内存在多个同名字段，按原顺序保留为多条记录">重复 name</span>`
+    : "";
+  const statusBadge = isFile
+    ? ""
+    : `<span class="fd-status fd-status-${f.status}">${escapeHtml(FD_STATUS_LABEL[f.status] || f.status)}</span>`;
+  const fileHtml = isFile
+    ? `<span class="fd-filename" title="filename 参数（不计入文本字段）">filename=<b>${escapeHtml(f.filename || "（无文件名）")}</b></span>`
+    : "";
+  top.innerHTML =
+    `<span class="fd-idx">#${idx}</span>` +
+    nameHtml + kindBadge + dupBadge + statusBadge + fileHtml;
+  li.appendChild(top);
+
+  const meta = document.createElement("div");
+  meta.className = "fd-meta";
+  meta.innerHTML =
+    `<span>${escapeHtml(f.path)}</span>` +
+    `<span>${escapeHtml(f.mediaType)}</span>` +
+    (!isFile && f.charset
+      ? `<span>charset: ${escapeHtml(f.charset)}（${escapeHtml(FD_CHARSET_SOURCE_LABEL[f.charsetSource] || f.charsetSource)}）</span>`
+      : "");
+  li.appendChild(meta);
+
+  if (isErr && f.reason) {
+    const r = document.createElement("div");
+    r.className = "fd-reason";
+    r.textContent = "⛔ " + f.reason;
+    li.appendChild(r);
+  } else if (!isFile) {
+    // textContent 原样呈现解码文本；解码失败时上面已显示原因，绝不伪造文本
+    const v = document.createElement("div");
+    v.className = "fd-value";
+    v.textContent = f.value;
+    li.appendChild(v);
+  }
+  return li;
+}
+
+// 导出当前结果为保序 JSON 数组（容器按先序、字段按容器内原顺序展开）
+function exportFormdata() {
+  if (!formdataResult || !formdataResult.ok) {
+    alert("暂无可导出的 form-data 字段结果，请先解析报文");
+    return;
+  }
+  const rows = [];
+  for (const c of formdataResult.containers || []) {
+    for (const f of c.fields || []) {
+      rows.push({
+        container: c.path,
+        path: f.path,
+        name: f.name,
+        kind: f.kind,
+        status: f.status,
+        charset: f.charset,
+        charsetSource: f.charsetSource,
+        value: f.value,
+        filename: f.filename,
+        reason: f.reason,
+      });
+    }
+  }
+  const blob = new Blob([JSON.stringify(rows, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "form-data-fields.json";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
 async function loadAttachments({ resetSelection = false } = {}) {
@@ -1378,6 +1568,9 @@ function init() {
   $("#btnDownloadZip").addEventListener("click", downloadAttachmentsZip);
   // CID 引用检查
   $("#btnRefreshCid").addEventListener("click", () => loadCidCheck());
+  // form-data 字段检查
+  $("#btnRefreshFormdata").addEventListener("click", () => loadFormdata());
+  $("#btnExportFormdata").addEventListener("click", exportFormdata);
   $("#attachSelectAll").addEventListener("change", (e) => {
     if (e.target.checked) {
       for (const a of attachments) {
